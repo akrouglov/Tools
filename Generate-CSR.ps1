@@ -80,3 +80,72 @@ if (!(test-path $CSRPath)) {
 }
 
 write-output "Certificate Request has been generated"
+
+
+---------------------------------------------------------------------------------------------------------------------------
+
+#requires dbatools
+
+$server = "servername"
+$localCertPath = "C:\CertificateRequests"
+$remoteCertPath = "C:\CertificateRequest\"
+
+$adminuser = Import-Clixml C:\user.cred #stored credentials to access remote server
+
+# Generate the CSR and download locally
+$session = New-PSSession $server -Credential $adminuser
+Invoke-Command -Session $session -FilePath 'C:\PowershellScripts\Certificates\Generate-CSR.ps1' #Separate script to generate CSR/INF files
+Copy-Item -Path $remoteCertPath -Destination $localCertPath -FromSession $session -Recurse -Force
+
+Disconnect-PSSession $session
+
+
+#######
+# Invoke-WebRequest code to get Cert
+# This will need to be adjusted for any given certificate authority
+
+$CSRFile = Get-ChildItem $localCertPath -Recurse -Filter "*$server*csr" #"C:\CertificateRequests\CertificateRequest\MSSQL_Cert_" + $server + ".csr"
+$certType = "CertificateTemplate:WebServer"  #certificate type requested by this particular request
+$certTypeHTML = [System.Net.WebUtility]::URLEncode($certType)
+$CertPostURI = "https://CertificateServer/certsrv/certfnsh.asp"
+    #$CertURI = "https://CertificateServer/certsrv/certrqxt.asp"
+    #$response = Invoke-WebRequest -Uri $CertURI -SessionVariable sessCert -UseDefaultCredential
+
+
+$CSRText = get-content $CSRFile
+$CSRTextHTML = [System.Net.WebUtility]::URLEncode($CSRText)
+$ContentType = "application/x-www-form-urlencoded"
+$body = 'Mode=newreq&CertRequest=' + $CSRTextHTML + '&CertAttrib=' + $certTypeHTML
+$certResponse = Invoke-WebRequest -Uri $CertPostURI -Method "POST" -ContentType $ContentType -Body $body -UseDefaultCredentials -SessionVariable $sessCert
+
+$regexmatch = 'certnew.cer\?ReqID=\d+' #', "(certnew.cer\?ReqID=)\d+"'
+
+$CertDownloadURI = "https://CertificateServer" + ($certResponse.Content | Select-String $regexmatch -AllMatches | ForEach-Object {$_.Matches} | ForEach-Object {$_.Groups[0].Value} ) + "&Enc=bin"
+
+$CertFile = ($CSRFile.FullName).Replace(".csr", ".DER.cer")
+Invoke-WebRequest -Uri $CertDownloadURI -SessionVariable $sessCert -UseDefaultCredentials -OutFile $CertFile
+
+
+#######
+# Copy file from local to remote
+$session = New-PSSession $server -Credential $adminuser
+Copy-Item -Path $CertFile -Destination $remoteCertPath -ToSession $session -Recurse -Force
+
+#Import Certificate
+Invoke-Command -ComputerName $server -Credential $adminuser -ScriptBlock { (gci c:\CertificateRequest -filter "*.cer") | Import-Certificate -CertStoreLocation "Cert:\LocalMachine\My"}
+
+#Get Thumbprint
+$script = {Get-ChildItem Cert:\LocalMachine\My\ | Where-Object FriendlyName -like "MSSQL*" | Select-Object Thumbprint}
+$thumb = Invoke-Command -Session $session -ScriptBlock $script
+
+#Register Certificate for SQL Instances
+$sqlinstance = Find-DbaInstance -ComputerName $server -Credential $adminuser
+$sqlinstance | Set-DbaNetworkCertificate -Credential $adminuser -Thumbprint ($thumb.Thumbprint).ToUpper()
+
+    # Restart-DbaService -ComputerName $server -InstanceName $sqlinstance.InstanceName -Credential $su
+
+$scriptRestartSQL = {Restart-Service MSSQLSERVER -Force}
+Invoke-Command -Session $session -ScriptBlock $scriptRestartSQL
+    
+
+Disconnect-PSSession $session
